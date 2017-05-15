@@ -84,11 +84,11 @@ object BandWidthService {
     recordDataFrame.createOrReplaceTempView("node_bandwidth_events")
 
     val sql = "select sp_channel, device_node as node_tag, " +
-      "to_date(from_unixtime(cast(msec as bigint) div 300 * 300)) as record_date" +
-      "from_unixtime(cast(msec as BIGINT) div 300 * 300) AS record_time," +
-      "sum(segment_bytes_sent + case when segment_type = 2 then request_length else 0 end) AS traffic" +
-      "sum(segment_bytes_sent + case when segment_type = 2 then request_length else 0 end)*8/300/1000/1000/1000 " +
-      "AS bandwidth from node_bandwidth_events " +
+      "cast(to_date(from_unixtime(cast(msec as bigint) div 300 * 300)) as String) as record_date, " +
+      "from_unixtime(cast(msec as BIGINT) div 300 * 300) AS record_time, " +
+      "sum(segment_bytes_sent + case when segment_type = 2 then request_length else 0 end) AS traffic, " +
+      "sum(segment_bytes_sent + case when segment_type = 2 then request_length else 0 end)*8/300/1000/1000/1000 AS bandwidth " +
+      "from node_bandwidth_events " +
       "where request_method != 'HEAD' and request_method != 'PURGE' and segment_type != 0 " +
       "group by sp_channel, device_node, from_unixtime(cast(msec as BIGINT) div 300 * 300)"
 
@@ -107,9 +107,10 @@ object BandWidthService {
   private def transactionSavePerBatch(results: Array[Row], offsetRanges: HasOffsetRanges, submitId: BigInt) = {
     DB.localTx { implicit session =>
       results.foreach { row =>
+        println(s"${row.getString(0)}, ${row.getString(1)}, ${row.getString(2)}, ${row.getString(3)}, ${row.getDecimal(4)}, ${row.getDecimal(5)}")
         val metricRows =
-          SQL("""insert into log_record values(?,?,?,?,?,?)""")
-            .bind(submitId, row.getString(1), row.getString(2), row.getDate(3), row.getTimestamp(4), row.getDecimal(5), row.getFloat(6))
+          SQL("""insert into log_record values(?,?,?,?,?,?,?)""")
+            .bind(submitId, row.getString(0), row.getString(1), row.getString(2), row.getString(3), row.getDecimal(4), row.getDecimal(5))
             .update()
             .apply()
         if (metricRows != 1) {
@@ -127,7 +128,6 @@ object BandWidthService {
           throw new IllegalStateException(s"""Got $offsetRows rows affected instead of 1 when attempting to update kafka offsets in DB for ${osr.topic} ${osr.partition} ${osr.fromOffset} -> ${osr.untilOffset}.Was a partition repeated after a worker failure?""".stripMargin)
         }
       }
-      session.close()
     }
   }
 }
