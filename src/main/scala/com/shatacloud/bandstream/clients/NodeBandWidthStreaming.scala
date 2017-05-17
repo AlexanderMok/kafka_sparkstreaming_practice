@@ -1,4 +1,4 @@
-package com.shatacloud.bandstream
+package com.shatacloud.bandstream.clients
 
 import com.shatacloud.bandstream.service.BandWidthService
 import com.shatacloud.bandstream.util.SetupJdbc
@@ -8,15 +8,13 @@ import org.apache.kafka.common.serialization.StringDeserializer
 import org.apache.spark.SparkConf
 import org.apache.spark.streaming.{Seconds, StreamingContext}
 import org.slf4j.{Logger, LoggerFactory}
-import scalikejdbc._
-
+import scalikejdbc.ConnectionPool
 
 /**
-  * Created by Alex on 2017/4/24.
+  * Created by Alex Mok on 2017/4/24.
   */
-object NodeStreaming {
-
-  val logger: Logger = LoggerFactory.getLogger(NodeStreaming.getClass)
+object NodeBandWidthStreaming {
+  val logger: Logger = LoggerFactory.getLogger(this.getClass)
 
   def main(args: Array[String]): Unit = {
     //init kafka
@@ -37,9 +35,11 @@ object NodeStreaming {
     val ssc = setupAndComputeStreamingContext(kafkaParams, jdbcDriver, jdbcUrl, jdbcUser, jdbcPassword, conf)()
 
     sys.ShutdownHookThread {
-      println("Gracefully stopping Spark Streaming Application")
+      println(s"Gracefully stopping Spark Streaming Application. Name ${ssc.sparkContext.appName}.")
+      logger.info(s"Gracefully stopping Spark Streaming Application. Name ${ssc.sparkContext.appName}.")
       ssc.stop(stopSparkContext = true, stopGracefully = true)
       ConnectionPool.closeAll()
+      logger.info(s"Application stopped.")
       println("Application stopped")
     }
 
@@ -49,16 +49,16 @@ object NodeStreaming {
   }
 
   def setupAndComputeStreamingContext(
-                kafkaParams: Map[String, Object],
-                jdbcDriver: String,
-                jdbcUrl: String,
-                jdbcUser: String,
-                jdbcPassword: String,
-                conf: Config
-              )(): StreamingContext = {
+                                       kafkaParams: Map[String, Object],
+                                       jdbcDriver: String,
+                                       jdbcUrl: String,
+                                       jdbcUser: String,
+                                       jdbcPassword: String,
+                                       conf: Config
+                                     )(): StreamingContext = {
     //init context
     val sparkConf: SparkConf = new SparkConf()
-      .setAppName("NodeBandwithStreming")
+      .setAppName("NodeBandwidthStreaming")
       .setMaster("local[2]")
       .set("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
     val ssc = new StreamingContext(sparkConf, Seconds(10))
@@ -67,8 +67,7 @@ object NodeStreaming {
     SetupJdbc(jdbcDriver, jdbcUrl, jdbcUser, jdbcPassword)
 
     // begin from the the offsets committed to the database
-    val fromOffsets = BandWidthService.getOffsetFromDB
-    println(fromOffsets.mkString(","))
-    BandWidthService.createAndAggregateStream(ssc, fromOffsets, kafkaParams)
+    val fromOffsets = BandWidthService.getOffsetFromDB(conf)
+    BandWidthService.createAndAggregateStream(ssc, fromOffsets, kafkaParams, conf)
   }
 }
