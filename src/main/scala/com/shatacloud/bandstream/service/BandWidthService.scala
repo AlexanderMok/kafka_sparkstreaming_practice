@@ -2,10 +2,9 @@ package com.shatacloud.bandstream.service
 
 import com.shatacloud.bandstream.manager.BandWidthManager
 import com.shatacloud.bandstream.model.LogRecordModel
-import com.shatacloud.bandstream.util.{SparkSessionSingleton, UniqueIdGenerator}
-import com.typesafe.config.Config
+import com.shatacloud.bandstream.util.SparkSessionSingleton
 import org.apache.kafka.clients.consumer.ConsumerRecord
-import org.apache.kafka.common.TopicPartition
+import org.apache.kafka.common.{KafkaException, TopicPartition}
 import org.apache.spark.TaskContext
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{DataFrame, Dataset, Row}
@@ -16,7 +15,7 @@ import org.slf4j.{Logger, LoggerFactory}
 /**
   * Created by Alex Mok
   */
-object BandWidthService {
+object BandWidthService extends BaseService {
 
   val logger: Logger = LoggerFactory.getLogger(BandWidthService.getClass)
 
@@ -25,8 +24,8 @@ object BandWidthService {
     *
     * @return kafka topic, partition_num, from_offset
     */
-  def getOffsetFromDB(conf: Config): Map[TopicPartition, Long] = {
-    BandWidthManager.findOffsetFromDB(conf)
+  override def getOffsetFromDB: Map[TopicPartition, Long] = {
+    BandWidthManager.findOffsetFromDB
   }
 
   /**
@@ -38,31 +37,34 @@ object BandWidthService {
     * @param kafkaParams   kafka configuration params
     * @return ssc StreamingContext
     */
-  def createAndAggregateStream(ssc: StreamingContext, dbFromOffsets: Map[TopicPartition, Long], kafkaParams: Map[String, Object], conf: Config): StreamingContext = {
+  override def createAndAggregateStream(ssc: StreamingContext, dbFromOffsets: Map[TopicPartition, Long], kafkaParams: Map[String, Object]): StreamingContext = {
     //val kafkaStream08 = org.apache.spark.streaming.kafka.KafkaUtils.createDirectStream[String,String](ssc, kafkaParams, topics)
     //val logStream08 = kafkaStream08.map(e => e._2).map(line => line.split("\\|"))
-    val stream = KafkaUtils.createDirectStream[String, String](
-      ssc,
-      LocationStrategies.PreferConsistent,
-      ConsumerStrategies.Assign[String, String](dbFromOffsets.keys.toList, kafkaParams, dbFromOffsets)
-    )
+    try {
+      val stream = KafkaUtils.createDirectStream[String, String](
+        ssc,
+        LocationStrategies.PreferConsistent,
+        ConsumerStrategies.Assign[String, String](dbFromOffsets.keys.toList, kafkaParams, dbFromOffsets)
+      )
+      stream.foreachRDD { (rdd, time) =>
+        val offsetRanges = rdd.asInstanceOf[HasOffsetRanges]
+        logger.debug(s"Kafka Offsets directly get from Kafka ${offsetRanges.offsetRanges.mkString("[", " , ", "]")}")
 
-    stream.foreachRDD { (rdd, time) =>
-      val offsetRanges = rdd.asInstanceOf[HasOffsetRanges]
-      logger.debug(s"Kafka Offsets directly get from Kafka ${offsetRanges.offsetRanges.mkString("[", " , ", "]")}")
+        val partitionId = TaskContext.getPartitionId() + 1
+        val uniqueId = this.generateSubmitId(time.milliseconds, partitionId)
+        val recordDataFrame = mapLogRecordModel(rdd)
+        val results = this.aggregateBandWidth(recordDataFrame, rdd).collect()
 
-      val partitionId = TaskContext.getPartitionId() + 1
-      val uniqueId = this.generateSubmitId(time.milliseconds, partitionId)
-      val recordDataFrame = mapLogRecordModel(rdd, conf)
-      val results = this.aggregateBandWidth(recordDataFrame, rdd).collect()
-
-      // Back to running on the driver
-      this.transactionSavePerBatch(results, offsetRanges, uniqueId, conf)
+        // Back to running on the driver and this will cause shuffle
+        this.transactionSavePerBatch(results, offsetRanges, uniqueId)
+        //rdd.foreachPartitionAsync(i => i.map{e=>e.value().split("\\|")}.map(e => if(e.length!=39){}))
+      }
+    } catch {
+      case e: KafkaException => logger.error(s"Create KafkaStream error. $e")
+      case e: Exception => logger.error(s"Aggregation of KafkaStream error. $e")
     }
     ssc
   }
-
-  private def generateSubmitId(milliseconds: Long, partitionId: Int): BigInt = UniqueIdGenerator.generateLongId(milliseconds).longValue() + partitionId
 
   /**
     * Map raw log record to LogRecordModel and save the raw data to Cassandra
@@ -71,14 +73,33 @@ object BandWidthService {
     * @return a DataFrame represents LogRecordModel
     */
 
-  private def mapLogRecordModel(rdd: RDD[ConsumerRecord[String, String]], conf: Config): Dataset[LogRecordModel] = {
+  private def mapLogRecordModel(rdd: RDD[ConsumerRecord[String, String]]): Dataset[LogRecordModel] = {
     val sparkSession = SparkSessionSingleton.getInstance(rdd.sparkContext.getConf)
     import sparkSession.implicits._
     val recordDataFrame = rdd.map(record => record.value().split("\\|"))
-      .map(e => LogRecordModel(e(0), e(1), e(2).toDouble, e(3), e(4), e(5).toInt, e(6).toDouble, e(7).toInt, e(8).toLong, e(9),
-        e(10).toInt, e(11), e(12), e(13), e(14), e(15).toDouble, e(16).toInt, e(17), e(18), e(19).toDouble, e(20), e(21).toDouble,
-        e(22), e(23), e(24), e(25).toDouble, e(26).toLong, e(27).toInt, e(28), e(29), e(30), e(31), e(32).toLong, e(33).toDouble,
-        e(34), e(35), e(36), e(37), e(38)))
+      .filter(e => {if(e.length != 39){logger.warn(e.mkString("Abnormal Log Record ["," , ","]"))}; e.length == 39})
+      .map(e => LogRecordModel(
+        e(0),
+        e(1),
+        e(2) match { case "-" => 0.0; case _ => e(2).toDouble },
+        e(3),
+        e(4),
+        e(5) match { case "-" => 0; case _ => e(5).toInt },
+        e(6) match { case "-" => 0.0; case _ => e(6).toDouble },
+        e(7) match { case "-" => 0; case _ => e(7).toInt },
+        e(8) match { case "-" => 0; case _ => e(8).toLong },
+        e(9),
+        e(10) match { case "-" => 0; case _ => e(10).toInt },
+        e(11), e(12), e(13), e(14),
+        e(15) match { case "-" => 0.0; case _ => e(15).toDouble },
+        e(16) match { case "-" => 0; case _ => e(16).toInt },
+        e(17), e(18), e(19) match { case "-" => 0.0; case _ => e(19).toDouble }, e(20),
+        e(21) match { case "-" => 0.0; case _ => e(21).toDouble }, e(22), e(23), e(24),
+        e(25) match { case "-" => 0.0; case _ => e(25).toDouble },
+        e(26) match { case "-" => 0; case _ => e(26).toLong },
+        e(27) match { case "-" => 0; case _ => e(27).toInt },
+        e(28), e(29), e(30), e(31), e(32) match { case "-" => 0; case _ => e(32).toLong },
+        e(33) match { case "-" => 0.0; case _ => e(33).toDouble }, e(34), e(35), e(36), e(37), e(38)))
       .toDS()
     //BandWidthManager.saveRawLogCassandra(recordDataFrame, conf)
     recordDataFrame
@@ -114,7 +135,7 @@ object BandWidthService {
     * @param hasOffsetRanges HasOffsetRanges that wraps a private OffsetRanges get from Direct Kafka API
     * @param submitId        a unique id generated by timestamp and partition id
     */
-  private def transactionSavePerBatch(results: Array[Row], hasOffsetRanges: HasOffsetRanges, submitId: BigInt, conf: Config) = {
-    BandWidthManager.transactionSavePerBatch(results, hasOffsetRanges, submitId, conf)
+  override def transactionSavePerBatch(results: Array[Row], hasOffsetRanges: HasOffsetRanges, submitId: BigInt) = {
+    BandWidthManager.transactionSavePerBatch(results, hasOffsetRanges, submitId)
   }
 }

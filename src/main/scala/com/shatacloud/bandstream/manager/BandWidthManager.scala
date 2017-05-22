@@ -1,6 +1,7 @@
 package com.shatacloud.bandstream.manager
 
 import com.shatacloud.bandstream.model.LogRecordModel
+import com.shatacloud.bandstream.util.AppConfig
 import com.typesafe.config.Config
 import org.apache.kafka.common.TopicPartition
 import org.apache.spark.sql.cassandra._
@@ -16,10 +17,10 @@ import scalikejdbc.{DB, SQL}
 object BandWidthManager {
   val logger: Logger = LoggerFactory.getLogger(BandWidthManager.getClass)
 
-  def findOffsetFromDB(conf: Config): Map[TopicPartition, Long] = {
+  def findOffsetFromDB: Map[TopicPartition, Long] = {
     val fromOffsets = DB.readOnly { implicit session =>
-      SQL("""select topic, partition_num, from_offset, until_offset from kafka_offset where topic in (?)""")
-        .bind(conf.getString("kafka.topic"))
+      SQL(s"""select topic, partition_num, from_offset from ${AppConfig.TABLE_KAFKA_OFFSET} where topic in (?)""")
+        .bind(AppConfig.TOPIC)
         .map { resultSet =>
           new TopicPartition(resultSet.string(1), resultSet.int(2)) -> resultSet.long(3)
         }.list.apply().toMap
@@ -28,11 +29,11 @@ object BandWidthManager {
     fromOffsets
   }
 
-  def transactionSavePerBatch(results: Array[Row], hasOffsetRanges: HasOffsetRanges, submitId: BigInt, conf: Config) = {
+  def transactionSavePerBatch(results: Array[Row], hasOffsetRanges: HasOffsetRanges, submitId: BigInt) = {
     DB.localTx { implicit session =>
       results.foreach { row =>
         val metricRows =
-          SQL(s"""insert into ${conf.getString("table.raw_aggregate_traffic_5")} values(?,?,?,?,?)""")
+          SQL(s"""insert into ${AppConfig.TABLE_AGGREGATE_TRAFFIC_5} values(?,?,?,?,?)""")
             .bind(
               submitId,
               row.getString(0) match { case null => "-"; case _ => row.getString(0) },
@@ -73,10 +74,11 @@ object BandWidthManager {
   }
 
   def transactionSavePerBatchCassandra(results: Array[Row], hasOffsetRanges: HasOffsetRanges, submitId: BigInt, conf: Config) = {
-
+    //TO DO
   }
 
   def saveRawLogCassandra(dataset: Dataset[LogRecordModel], conf: Config): Dataset[LogRecordModel] = {
+    //TO DO
     dataset.write.format("org.apache.spark.sql.cassandra").cassandraFormat("","","").save()
     dataset
   }
